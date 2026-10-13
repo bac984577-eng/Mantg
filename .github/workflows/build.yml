@@ -1,0 +1,1935 @@
+name: Build APK
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Generate project files
+        run: |
+          cat > 'settings.gradle.kts' <<'LP_EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "LecturePlayer"
+          include(":app")
+          LP_EOF
+          cat > 'build.gradle.kts' <<'LP_EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          LP_EOF
+          cat > 'gradle.properties' <<'LP_EOF'
+          org.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          android.nonTransitiveRClass=true
+          kotlin.code.style=official
+          LP_EOF
+          mkdir -p 'app'
+          cat > 'app/build.gradle.kts' <<'LP_EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "app.lectureplayer"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "app.lectureplayer"
+                  minSdk = 24
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              buildTypes {
+                  release {
+                      isMinifyEnabled = false
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+
+          dependencies {
+              implementation("androidx.media3:media3-exoplayer:1.3.1")
+          }
+          LP_EOF
+          mkdir -p 'app/src/main'
+          cat > 'app/src/main/AndroidManifest.xml' <<'LP_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+              <application
+                  android:allowBackup="false"
+                  android:icon="@drawable/ic_app"
+                  android:label="مشغل المحاضرة"
+                  android:supportsRtl="true"
+                  android:theme="@android:style/Theme.Material.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:configChanges="orientation|screenSize|keyboardHidden|smallestScreenSize|screenLayout"
+                      android:exported="true"
+                      android:launchMode="singleTask">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".PlayerService"
+                      android:exported="false"
+                      android:foregroundServiceType="mediaPlayback" />
+              </application>
+          </manifest>
+          LP_EOF
+          mkdir -p 'app/src/main/res/drawable'
+          cat > 'app/src/main/res/drawable/ic_app.xml' <<'LP_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="96dp"
+              android:height="96dp"
+              android:viewportWidth="96"
+              android:viewportHeight="96">
+              <path
+                  android:fillColor="#0E6A60"
+                  android:pathData="M48,48m-44,0a44,44 0 1,1 88,0a44,44 0 1,1 -88,0" />
+              <path
+                  android:fillColor="#FFFFFF"
+                  android:pathData="M24,48l18,-14l0,28z" />
+              <path
+                  android:fillColor="#FFFFFF"
+                  android:pathData="M72,48l-18,-14l0,28z" />
+          </vector>
+          LP_EOF
+          mkdir -p 'app/src/main/java/app/lectureplayer'
+          cat > 'app/src/main/java/app/lectureplayer/PlayerService.kt' <<'LP_EOF'
+          package app.lectureplayer
+
+          import android.animation.Animator
+          import android.animation.AnimatorListenerAdapter
+          import android.animation.ValueAnimator
+          import android.annotation.SuppressLint
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.app.Service
+          import android.content.Context
+          import android.content.Intent
+          import android.content.SharedPreferences
+          import android.content.pm.ServiceInfo
+          import android.content.res.Configuration
+          import android.graphics.Canvas
+          import android.graphics.Color
+          import android.graphics.Paint
+          import android.graphics.Path
+          import android.graphics.PixelFormat
+          import android.graphics.RectF
+          import android.graphics.Typeface
+          import android.graphics.drawable.GradientDrawable
+          import android.graphics.drawable.Icon
+          import android.net.Uri
+          import android.os.Binder
+          import android.os.Build
+          import android.os.Handler
+          import android.os.IBinder
+          import android.os.Looper
+          import android.provider.Settings
+          import android.text.SpannableString
+          import android.text.Spanned
+          import android.text.style.RelativeSizeSpan
+          import android.view.Gravity
+          import android.view.HapticFeedbackConstants
+          import android.view.MotionEvent
+          import android.view.View
+          import android.view.ViewConfiguration
+          import android.view.ViewGroup
+          import android.view.WindowManager
+          import android.view.animation.OvershootInterpolator
+          import android.widget.FrameLayout
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import android.widget.Toast
+          import androidx.media3.common.AudioAttributes
+          import androidx.media3.common.C
+          import androidx.media3.common.MediaItem
+          import androidx.media3.common.Player
+          import androidx.media3.exoplayer.ExoPlayer
+          import androidx.media3.exoplayer.SeekParameters
+          import java.util.Locale
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import kotlin.math.abs
+          import kotlin.math.atan2
+          import kotlin.math.cos
+          import kotlin.math.hypot
+          import kotlin.math.max
+          import kotlin.math.min
+          import kotlin.math.sin
+
+          private val C_ACCENT = Color.parseColor("#1FB8CE")
+          private val C_DARK = Color.parseColor("#04222E")
+          private val C_SURFACE = Color.parseColor("#12384F")
+          private val C_LINE = Color.parseColor("#245D7C")
+          private val C_RED = Color.parseColor("#E0463C")
+          private val C_TEXT = Color.parseColor("#F4F7F8")
+          private val C_MUTED = Color.parseColor("#9DB6C4")
+
+          /**
+           * Owns the single ExoPlayer and the floating ball.
+           * Runs as a foreground media-playback service so playback stays smooth
+           * while the user types in another app.
+           */
+          class PlayerService : Service() {
+
+              inner class LocalBinder : Binder() {
+                  val service: PlayerService get() = this@PlayerService
+              }
+
+              private val binder = LocalBinder()
+              private val handler = Handler(Looper.getMainLooper())
+              private lateinit var prefs: SharedPreferences
+
+              lateinit var player: ExoPlayer
+                  private set
+
+              var hasMedia = false
+                  private set
+
+              class Track(val uri: String, val name: String)
+
+              val playlist = ArrayList<Track>()
+
+              /** Changes whenever the list or the current track changes, so the screen knows to redraw. */
+              var playlistVersion = 0
+                  private set
+
+              val title: String
+                  get() = playlist.getOrNull(player.currentMediaItemIndex)?.name ?: ""
+
+              val currentIndex: Int
+                  get() = if (playlist.isEmpty()) -1 else player.currentMediaItemIndex.coerceIn(0, playlist.size - 1)
+
+              private var lastIdx = 0
+              private var ballHidden = false
+
+              private var windowManager: WindowManager? = null
+              private var ball: View? = null
+              private var ballParams: WindowManager.LayoutParams? = null
+              private var root: FrameLayout? = null
+              private var ballGroup: FrameLayout? = null
+              private var ring: RingView? = null
+              private var menuView: RadialMenuView? = null
+              private var centerIcon: PlayPauseIcon? = null
+
+              private var menuOpen = false
+              private var enlarged = false
+              private var menuAnim: ValueAnimator? = null
+
+              private var abA: Long? = null
+              private var abB: Long? = null
+
+              private var panel: View? = null
+              private val panelRows = ArrayList<TextView>()
+              private val panelStarts = ArrayList<Long>()
+              private var panelIdx = -1
+
+              private val saver = object : Runnable {
+                  override fun run() {
+                      savePosition()
+                      handler.postDelayed(this, 4000)
+                  }
+              }
+
+              private val ticker = object : Runnable {
+                  override fun run() {
+                      if (hasMedia) {
+                          enforceLoop()
+                          updateRing()
+                          refreshPanel()
+                      }
+                      handler.postDelayed(this, if (player.isPlaying) 100L else 350L)
+                  }
+              }
+
+              override fun onCreate() {
+                  super.onCreate()
+                  prefs = getSharedPreferences("lp", Context.MODE_PRIVATE)
+                  ballHidden = prefs.getBoolean("ball_hidden", false)
+                  player = ExoPlayer.Builder(this)
+                      .setAudioAttributes(
+                          AudioAttributes.Builder()
+                              .setUsage(C.USAGE_MEDIA)
+                              .setContentType(C.AUDIO_CONTENT_TYPE_SPEECH)
+                              .build(),
+                          true
+                      )
+                      .setHandleAudioBecomingNoisy(true)
+                      .setWakeMode(C.WAKE_MODE_LOCAL)
+                      .build()
+                  player.setSeekParameters(SeekParameters.EXACT)
+                  player.addListener(object : Player.Listener {
+                      override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
+                          centerIcon?.setPlaying(playWhenReady)
+                      }
+
+                      override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
+                          val prev = lastIdx
+                          if (reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO && prev in playlist.indices) {
+                              // the previous recording finished: next time it starts from the beginning
+                              prefs.edit().putLong(posKey(prev), 0L).apply()
+                          }
+                          lastIdx = player.currentMediaItemIndex
+                          abA = null
+                          abB = null
+                          hidePanel()
+                          updateRing()
+                          playlistVersion++
+                          if (hasMedia) {
+                              notificationManager().notify(NOTIF_ID, buildNotification())
+                              savePosition()
+                          }
+                      }
+
+                      override fun onPlaybackStateChanged(playbackState: Int) {
+                          if (playbackState == Player.STATE_ENDED && playlist.isNotEmpty()) {
+                              // whole list finished: remember the start of the list
+                              val last = playlist.size - 1
+                              prefs.edit()
+                                  .putInt("last_i", 0)
+                                  .putLong("last_p", 0L)
+                                  .putLong(posKey(last), 0L)
+                                  .apply()
+                          }
+                      }
+
+                      override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
+                          val i = player.currentMediaItemIndex
+                          val name = playlist.getOrNull(i)?.name ?: ""
+                          say("تعذر تشغيل: " + name)
+                          if (player.hasNextMediaItem()) {
+                              player.seekToNextMediaItem()
+                              player.prepare()
+                              player.playWhenReady = true
+                          }
+                      }
+                  })
+                  createChannel()
+                  loadPlaylist()
+                  handler.postDelayed(saver, 4000)
+                  handler.post(ticker)
+              }
+
+              override fun onBind(intent: Intent?): IBinder = binder
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  val action = intent?.action
+                  if (action == ACTION_STOP) {
+                      fullStop()
+                      return START_NOT_STICKY
+                  }
+                  if (action == ACTION_CLEAR) {
+                      clearAll()
+                      return START_NOT_STICKY
+                  }
+                  enterForeground()
+                  when (action) {
+                      ACTION_ADD -> {
+                          val us = intent?.getStringArrayListExtra(EXTRA_URIS)
+                          val ns = intent?.getStringArrayListExtra(EXTRA_NAMES)
+                          if (us != null && ns != null) addTracks(us, ns)
+                      }
+                      ACTION_PLAY_INDEX -> playIndex(intent?.getIntExtra(EXTRA_INDEX, 0) ?: 0)
+                      ACTION_RESUME -> resume()
+                  }
+                  showBall()
+                  return START_NOT_STICKY
+              }
+
+              // ------------------------------------------------- playlist and memory
+
+              private fun posKey(i: Int): String = "p_" + playlist[i].uri.hashCode()
+
+              private fun mediaItemOf(t: Track): MediaItem =
+                  MediaItem.Builder().setUri(Uri.parse(t.uri)).setMediaId(t.uri).build()
+
+              private fun savePlaylist() {
+                  val arr = JSONArray()
+                  for (t in playlist) {
+                      val o = JSONObject()
+                      o.put("u", t.uri)
+                      o.put("n", t.name)
+                      arr.put(o)
+                  }
+                  prefs.edit().putString("playlist", arr.toString()).apply()
+              }
+
+              /** Restores the saved list and the place where listening stopped, without playing yet. */
+              private fun loadPlaylist() {
+                  val s = prefs.getString("playlist", null) ?: return
+                  try {
+                      val arr = JSONArray(s)
+                      for (i in 0 until arr.length()) {
+                          val o = arr.getJSONObject(i)
+                          playlist.add(Track(o.getString("u"), o.getString("n")))
+                      }
+                  } catch (e: Exception) {
+                      playlist.clear()
+                  }
+                  if (playlist.isEmpty()) return
+                  val items = ArrayList<MediaItem>()
+                  for (t in playlist) items.add(mediaItemOf(t))
+                  val idx = prefs.getInt("last_i", 0).coerceIn(0, playlist.size - 1)
+                  val pos = prefs.getLong("last_p", 0L)
+                  player.setMediaItems(items, idx, pos)
+                  player.prepare()
+                  lastIdx = idx
+                  playlistVersion++
+              }
+
+              private fun addTracks(uris: List<String>, names: List<String>) {
+                  val first = playlist.size
+                  for (i in 0 until min(uris.size, names.size)) {
+                      val t = Track(uris[i], names[i])
+                      playlist.add(t)
+                      player.addMediaItem(mediaItemOf(t))
+                  }
+                  savePlaylist()
+                  playlistVersion++
+                  if (!hasMedia && first < playlist.size) playIndex(first)
+              }
+
+              /** Plays the given track, continuing from where it was last stopped. */
+              fun playIndex(i: Int) {
+                  if (i !in playlist.indices) return
+                  savePosition()
+                  val saved = prefs.getLong(posKey(i), 0L)
+                  hasMedia = true
+                  if (player.playbackState == Player.STATE_IDLE) player.prepare()
+                  player.seekTo(i, if (saved > 0L) saved else 0L)
+                  player.playWhenReady = true
+                  playlistVersion++
+                  notificationManager().notify(NOTIF_ID, buildNotification())
+              }
+
+              /** Continues from the track and position where listening stopped. */
+              private fun resume() {
+                  if (playlist.isEmpty()) return
+                  if (player.playbackState == Player.STATE_ENDED) {
+                      playIndex(0)
+                      return
+                  }
+                  hasMedia = true
+                  if (player.playbackState == Player.STATE_IDLE) player.prepare()
+                  player.playWhenReady = true
+                  notificationManager().notify(NOTIF_ID, buildNotification())
+              }
+
+              private fun clearAll() {
+                  player.stop()
+                  player.clearMediaItems()
+                  playlist.clear()
+                  prefs.edit().remove("playlist").remove("last_i").remove("last_p").apply()
+                  hasMedia = false
+                  abA = null
+                  abB = null
+                  lastIdx = 0
+                  playlistVersion++
+                  hideBall()
+                  stopForeground(STOP_FOREGROUND_REMOVE)
+                  stopSelf()
+              }
+
+              /** Remembers the track and position, and the position of that track on its own. */
+              private fun savePosition() {
+                  if (!hasMedia || playlist.isEmpty()) return
+                  val i = player.currentMediaItemIndex
+                  if (i !in playlist.indices) return
+                  val p = player.currentPosition
+                  if (p < 0L) return
+                  prefs.edit().putInt("last_i", i).putLong("last_p", p).putLong(posKey(i), p).apply()
+              }
+
+              private fun fullStop() {
+                  savePosition()
+                  player.playWhenReady = false
+                  hasMedia = false
+                  abA = null
+                  abB = null
+                  hideBall()
+                  stopForeground(STOP_FOREGROUND_REMOVE)
+                  stopSelf()
+              }
+
+              /** Back or forward by the given number of milliseconds. */
+              fun skip(deltaMs: Long) {
+                  if (!hasMedia) return
+                  var t = player.currentPosition + deltaMs
+                  val dur = player.duration
+                  if (t < 0L) t = 0L
+                  if (dur != C.TIME_UNSET && t > dur) t = dur
+                  player.seekTo(t)
+                  updateRing()
+              }
+
+              /** Pause when playing, resume when paused. */
+              fun togglePlay() {
+                  if (!hasMedia) return
+                  if (player.playbackState == Player.STATE_ENDED) {
+                      playIndex(0)
+                  } else {
+                      player.playWhenReady = !player.playWhenReady
+                  }
+              }
+
+              fun isBallShown(): Boolean = ball != null
+
+              fun setBallVisible(visible: Boolean) {
+                  ballHidden = !visible
+                  prefs.edit().putBoolean("ball_hidden", ballHidden).apply()
+                  if (visible) showBall() else hideBall()
+              }
+
+              // ------------------------------------------------------------ A-B loop
+
+              private fun say(msg: String) {
+                  Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
+              }
+
+              private fun setPointA() {
+                  if (!hasMedia) return
+                  val p = player.currentPosition
+                  val b = abB
+                  if (b != null && p >= b - 500L) abB = null
+                  abA = p
+                  say("A: " + fmt(p))
+                  updateRing()
+              }
+
+              private fun setPointB() {
+                  if (!hasMedia) return
+                  val a = abA
+                  if (a == null) {
+                      say("حدّد النقطة A أولًا")
+                      return
+                  }
+                  val p = player.currentPosition
+                  if (p <= a + 1000L) {
+                      say("يجب أن تكون B بعد A")
+                      return
+                  }
+                  abB = p
+                  say("تكرار من " + fmt(a) + " إلى " + fmt(p))
+                  updateRing()
+              }
+
+              private fun clearAb() {
+                  abA = null
+                  abB = null
+                  say("تم مسح A-B")
+                  updateRing()
+              }
+
+              private fun enforceLoop() {
+                  val a = abA
+                  val b = abB
+                  if (a == null || b == null) return
+                  if (!player.playWhenReady) return
+                  if (player.currentPosition >= b) player.seekTo(a)
+              }
+
+              private fun updateRing() {
+                  val rv = ring ?: return
+                  val dur = player.duration
+                  if (dur == C.TIME_UNSET || dur <= 0L) {
+                      rv.setState(0f, -1f, -1f)
+                      return
+                  }
+                  val a = abA
+                  val b = abB
+                  rv.setState(
+                      player.currentPosition.toFloat() / dur,
+                      if (a != null) a.toFloat() / dur else -1f,
+                      if (b != null) b.toFloat() / dur else -1f
+                  )
+              }
+
+              // ---------------------------------------------------------------- ball
+
+              private fun px(v: Float): Int = (v * resources.displayMetrics.density).toInt()
+
+              private fun overlayType(): Int =
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+                  } else {
+                      @Suppress("DEPRECATION")
+                      WindowManager.LayoutParams.TYPE_PHONE
+                  }
+
+              fun showBall() {
+                  if (ball != null || !hasMedia || ballHidden) return
+                  if (!Settings.canDrawOverlays(this)) return
+                  val manager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+                  windowManager = manager
+                  val dm = resources.displayMetrics
+                  val size = px(S_DP)
+                  val lp = WindowManager.LayoutParams(
+                      size, size, overlayType(),
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                          WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                          WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                          WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                      PixelFormat.TRANSLUCENT
+                  )
+                  lp.gravity = Gravity.TOP or Gravity.LEFT
+                  lp.x = prefs.getInt("bx", px(16f))
+                  lp.y = prefs.getInt("by", dm.heightPixels / 3)
+                  clamp(lp)
+                  val view = buildBall(size)
+                  attachTouch(view, lp)
+                  try {
+                      manager.addView(view, lp)
+                  } catch (e: Exception) {
+                      return
+                  }
+                  ball = view
+                  ballParams = lp
+                  updateRing()
+              }
+
+              fun hideBall() {
+                  menuAnim?.cancel()
+                  menuOpen = false
+                  enlarged = false
+                  hidePanel()
+                  val v = ball
+                  if (v != null) {
+                      try {
+                          windowManager?.removeView(v)
+                      } catch (e: Exception) {
+                      }
+                  }
+                  ball = null
+                  ballParams = null
+                  root = null
+                  ballGroup = null
+                  ring = null
+                  menuView = null
+                  centerIcon = null
+              }
+
+              private fun buildBall(size: Int): FrameLayout {
+                  val d = resources.displayMetrics.density
+                  val r = FrameLayout(this)
+                  r.layoutDirection = View.LAYOUT_DIRECTION_LTR
+
+                  val group = FrameLayout(this)
+                  val rv = RingView(this)
+                  group.addView(rv, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+
+                  val dd = px(D_DP)
+                  val circle = FrameLayout(this)
+                  val bg = GradientDrawable()
+                  bg.shape = GradientDrawable.OVAL
+                  bg.setColor(Color.parseColor("#F01B5E86"))
+                  bg.setStroke((2 * d).toInt(), Color.parseColor("#CC1FB8CE"))
+                  circle.background = bg
+
+                  val side = (dd * 0.3f).toInt()
+                  circle.addView(half("«"), FrameLayout.LayoutParams(side, dd, Gravity.LEFT))
+                  circle.addView(half("»"), FrameLayout.LayoutParams(side, dd, Gravity.RIGHT))
+
+                  val c = (dd * 0.4f).toInt()
+                  val icon = PlayPauseIcon(this)
+                  val btn = GradientDrawable()
+                  btn.shape = GradientDrawable.OVAL
+                  btn.setColor(C_RED)
+                  btn.setStroke((2 * d).toInt(), C_TEXT)
+                  icon.background = btn
+                  icon.setPlaying(player.playWhenReady)
+                  circle.addView(icon, FrameLayout.LayoutParams(c, c, Gravity.CENTER))
+
+                  group.addView(circle, FrameLayout.LayoutParams(dd, dd, Gravity.CENTER))
+                  r.addView(group, FrameLayout.LayoutParams(size, size, Gravity.CENTER))
+
+                  val mv = RadialMenuView(this)
+                  mv.visibility = View.GONE
+                  r.addView(mv, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+
+                  root = r
+                  ballGroup = group
+                  ring = rv
+                  menuView = mv
+                  centerIcon = icon
+                  return r
+              }
+
+              private fun half(symbol: String): TextView {
+                  val s = SpannableString(symbol + "\n15")
+                  s.setSpan(RelativeSizeSpan(1.7f), 0, 1, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+                  val tv = TextView(this)
+                  tv.text = s
+                  tv.setTextColor(Color.WHITE)
+                  tv.gravity = Gravity.CENTER
+                  tv.typeface = Typeface.DEFAULT_BOLD
+                  tv.textSize = 15f
+                  tv.includeFontPadding = false
+                  return tv
+              }
+
+              private fun clamp(lp: WindowManager.LayoutParams) {
+                  val dm = resources.displayMetrics
+                  lp.x = lp.x.coerceIn(0, max(0, dm.widthPixels - lp.width))
+                  lp.y = lp.y.coerceIn(0, max(0, dm.heightPixels - lp.height))
+              }
+
+              /** 0 = back, 1 = pause button, 2 = forward, -1 = ring area (no action). */
+              private fun zone(v: View, e: MotionEvent): Int {
+                  val dd = px(D_DP).toFloat()
+                  val w = v.width.toFloat()
+                  val h = v.height.toFloat()
+                  if (hypot(e.x - w / 2f, e.y - h / 2f) > dd / 2f) return -1
+                  val frac = (e.x - (w - dd) / 2f) / dd
+                  return if (frac < 0.3f) 0 else if (frac > 0.7f) 2 else 1
+              }
+
+              @SuppressLint("ClickableViewAccessibility")
+              private fun attachTouch(view: View, lp: WindowManager.LayoutParams) {
+                  var downX = 0f
+                  var downY = 0f
+                  var startX = 0
+                  var startY = 0
+                  var moved = false
+                  var fired = false
+                  var downItem = -1
+                  val slop = ViewConfiguration.get(this).scaledTouchSlop
+
+                  val longPress = Runnable {
+                      if (!moved && !menuOpen) {
+                          fired = true
+                          view.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+                          openMenu()
+                      }
+                  }
+
+                  view.setOnTouchListener { v, e ->
+                      when (e.actionMasked) {
+                          MotionEvent.ACTION_DOWN -> {
+                              downX = e.rawX
+                              downY = e.rawY
+                              startX = lp.x
+                              startY = lp.y
+                              moved = false
+                              fired = false
+                              downItem = -1
+                              val mv = menuView
+                              if (menuOpen) {
+                                  downItem = mv?.itemAt(e.x, e.y) ?: -1
+                                  mv?.pressedIdx = downItem
+                              } else if (zone(v, e) == 1) {
+                                  handler.postDelayed(longPress, ViewConfiguration.getLongPressTimeout().toLong())
+                              }
+                              true
+                          }
+                          MotionEvent.ACTION_MOVE -> {
+                              if (menuOpen) {
+                                  if (fired) menuView?.pressedIdx = menuView?.itemAt(e.x, e.y) ?: -1
+                              } else {
+                                  val dx = e.rawX - downX
+                                  val dy = e.rawY - downY
+                                  if (!moved && (abs(dx) > slop || abs(dy) > slop)) {
+                                      moved = true
+                                      handler.removeCallbacks(longPress)
+                                  }
+                                  if (moved) {
+                                      lp.x = (startX + dx).toInt()
+                                      lp.y = (startY + dy).toInt()
+                                      clamp(lp)
+                                      try {
+                                          windowManager?.updateViewLayout(v, lp)
+                                      } catch (ex: Exception) {
+                                      }
+                                  }
+                              }
+                              true
+                          }
+                          MotionEvent.ACTION_UP -> {
+                              handler.removeCallbacks(longPress)
+                              if (menuOpen) {
+                                  val it = menuView?.itemAt(e.x, e.y) ?: -1
+                                  val had = fired
+                                  fired = false
+                                  menuView?.pressedIdx = -1
+                                  if (it >= 0 && (had || it == downItem)) {
+                                      runItem(it)
+                                  } else if (!had) {
+                                      closeMenu()
+                                  }
+                              } else if (moved) {
+                                  prefs.edit().putInt("bx", lp.x).putInt("by", lp.y).apply()
+                              } else if (!fired) {
+                                  val z = zone(v, e)
+                                  if (z == 0 || z == 2 || z == 1) {
+                                      if (z == 0) skip(-SKIP_MS) else if (z == 2) skip(SKIP_MS) else togglePlay()
+                                      v.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
+                                      val g = ballGroup
+                                      if (g != null) {
+                                          g.animate().scaleX(0.9f).scaleY(0.9f).setDuration(70).withEndAction {
+                                              g.animate().scaleX(1f).scaleY(1f).setDuration(90).start()
+                                          }.start()
+                                      }
+                                  }
+                              }
+                              true
+                          }
+                          MotionEvent.ACTION_CANCEL -> {
+                              handler.removeCallbacks(longPress)
+                              menuView?.pressedIdx = -1
+                              true
+                          }
+                          MotionEvent.ACTION_OUTSIDE -> {
+                              if (menuOpen) closeMenu()
+                              true
+                          }
+                          else -> false
+                      }
+                  }
+              }
+
+              // --------------------------------------------------------- radial menu
+
+              private fun menuItems(): List<RadialMenuView.Item> {
+                  val a = abA
+                  val b = abB
+                  val any = a != null || b != null
+                  return listOf(
+                      RadialMenuView.Item("A", if (a != null) "A " + fmt(a) else "نقطة A", if (a != null) C_ACCENT else C_SURFACE, false),
+                      RadialMenuView.Item("B", if (b != null) "B " + fmt(b) else "نقطة B", if (b != null) C_ACCENT else C_SURFACE, false),
+                      RadialMenuView.Item("X", "مسح", if (any) C_RED else C_SURFACE, !any),
+                      RadialMenuView.Item("L", "الأجزاء", C_SURFACE, false)
+                  )
+              }
+
+              private fun runItem(i: Int) {
+                  when (i) {
+                      0 -> setPointA()
+                      1 -> setPointB()
+                      2 -> clearAb()
+                      3 -> showPanel()
+                  }
+                  closeMenu()
+              }
+
+              private fun openMenu() {
+                  val lp = ballParams ?: return
+                  val r = root ?: return
+                  val mv = menuView ?: return
+                  if (menuOpen) return
+                  menuAnim?.cancel()
+                  if (enlarged) finishClose()
+                  val s = px(S_DP)
+                  val m = px(M_DP)
+                  val cx = lp.x + s / 2
+                  val cy = lp.y + s / 2
+                  val dm = resources.displayMetrics
+                  val base = atan2(dm.heightPixels / 2f - cy, dm.widthPixels / 2f - cx)
+                  mv.configure(menuItems(), base)
+                  mv.t = 0f
+                  lp.width = m
+                  lp.height = m
+                  lp.x = cx - m / 2
+                  lp.y = cy - m / 2
+                  lp.flags = lp.flags or WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH
+                  val halo = GradientDrawable()
+                  halo.shape = GradientDrawable.OVAL
+                  halo.setColor(Color.parseColor("#CC0B2536"))
+                  halo.setStroke(px(1f), Color.parseColor("#55FFFFFF"))
+                  halo.setAlpha(0)
+                  r.background = halo
+                  mv.visibility = View.VISIBLE
+                  try {
+                      windowManager?.updateViewLayout(r, lp)
+                  } catch (e: Exception) {
+                  }
+                  enlarged = true
+                  menuOpen = true
+                  animateMenu(1f, null)
+              }
+
+              private fun closeMenu() {
+                  if (!menuOpen) return
+                  menuOpen = false
+                  menuView?.pressedIdx = -1
+                  animateMenu(0f) { finishClose() }
+              }
+
+              private fun finishClose() {
+                  if (!enlarged) return
+                  val lp = ballParams
+                  val r = root
+                  val mv = menuView
+                  if (lp != null && r != null && mv != null) {
+                      val s = px(S_DP)
+                      val m = px(M_DP)
+                      val cx = lp.x + m / 2
+                      val cy = lp.y + m / 2
+                      lp.width = s
+                      lp.height = s
+                      lp.x = cx - s / 2
+                      lp.y = cy - s / 2
+                      lp.flags = lp.flags and WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH.inv()
+                      mv.visibility = View.GONE
+                      r.background = null
+                      try {
+                          windowManager?.updateViewLayout(r, lp)
+                      } catch (e: Exception) {
+                      }
+                  }
+                  enlarged = false
+              }
+
+              private fun animateMenu(to: Float, end: (() -> Unit)?) {
+                  val mv = menuView ?: return
+                  menuAnim?.cancel()
+                  val a = ValueAnimator.ofFloat(mv.t, to)
+                  a.duration = if (to > 0f) 380L else 200L
+                  a.addUpdateListener {
+                      val v = it.animatedValue as Float
+                      mv.t = v
+                      root?.background?.setAlpha((255 * v.coerceIn(0f, 1f)).toInt())
+                  }
+                  a.addListener(object : AnimatorListenerAdapter() {
+                      private var cancelled = false
+                      override fun onAnimationCancel(animation: Animator) {
+                          cancelled = true
+                      }
+
+                      override fun onAnimationEnd(animation: Animator) {
+                          if (!cancelled) end?.invoke()
+                      }
+                  })
+                  menuAnim = a
+                  a.start()
+              }
+
+              override fun onConfigurationChanged(newConfig: Configuration) {
+                  super.onConfigurationChanged(newConfig)
+                  menuAnim?.cancel()
+                  menuOpen = false
+                  finishClose()
+                  hidePanel()
+                  val v = ball
+                  val lp = ballParams
+                  if (v != null && lp != null) {
+                      clamp(lp)
+                      try {
+                          windowManager?.updateViewLayout(v, lp)
+                      } catch (e: Exception) {
+                      }
+                  }
+              }
+
+              // ------------------------------------------------------ segments panel
+
+              private fun showPanel() {
+                  if (panel != null) return
+                  if (!hasMedia) return
+                  if (!Settings.canDrawOverlays(this)) return
+                  val manager = windowManager ?: (getSystemService(Context.WINDOW_SERVICE) as WindowManager)
+                  windowManager = manager
+                  val dm = resources.displayMetrics
+                  val w = min(dm.widthPixels - px(32f), px(420f))
+                  val h = min((dm.heightPixels * 0.6f).toInt(), px(480f))
+
+                  val box = LinearLayout(this)
+                  box.orientation = LinearLayout.VERTICAL
+                  box.layoutDirection = View.LAYOUT_DIRECTION_RTL
+                  val bg = GradientDrawable()
+                  bg.cornerRadius = px(20f).toFloat()
+                  bg.setColor(Color.parseColor("#F20B2536"))
+                  bg.setStroke(px(1f), C_LINE)
+                  box.background = bg
+                  box.setPadding(px(14f), px(12f), px(14f), px(12f))
+
+                  val head = LinearLayout(this)
+                  head.orientation = LinearLayout.HORIZONTAL
+                  head.gravity = Gravity.CENTER_VERTICAL
+                  val ttl = TextView(this)
+                  ttl.text = "أجزاء التسجيل · كل 5 دقائق"
+                  ttl.setTextColor(C_TEXT)
+                  ttl.textSize = 16f
+                  ttl.typeface = Typeface.DEFAULT_BOLD
+                  head.addView(ttl, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                  val close = TextView(this)
+                  close.text = "✕"
+                  close.setTextColor(C_MUTED)
+                  close.textSize = 20f
+                  close.setPadding(px(10f), px(4f), px(10f), px(4f))
+                  close.setOnClickListener { hidePanel() }
+                  head.addView(close, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+                  box.addView(head, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+
+                  val scroll = ScrollView(this)
+                  val list = LinearLayout(this)
+                  list.orientation = LinearLayout.VERTICAL
+                  scroll.addView(list, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+                  val sp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
+                  sp.topMargin = px(8f)
+                  box.addView(scroll, sp)
+
+                  panelRows.clear()
+                  panelStarts.clear()
+                  val dur = player.duration
+                  if (dur == C.TIME_UNSET || dur <= 0L) {
+                      val msg = TextView(this)
+                      msg.text = "جارٍ قراءة مدة التسجيل… أعد فتح القائمة بعد لحظات."
+                      msg.setTextColor(C_MUTED)
+                      msg.textSize = 15f
+                      list.addView(msg)
+                  } else {
+                      val n = ((dur + SEG_MS - 1L) / SEG_MS).toInt()
+                      for (i in 0 until n) {
+                          val st = i * SEG_MS
+                          val en = min(dur, st + SEG_MS)
+                          val tv = TextView(this)
+                          tv.text = "الجزء " + (i + 1) + "  ·  " + fmt(st) + " – " + fmt(en)
+                          tv.textSize = 16f
+                          tv.setPadding(px(14f), px(12f), px(14f), px(12f))
+                          tv.setOnClickListener {
+                              player.seekTo(st)
+                              player.playWhenReady = true
+                              hidePanel()
+                          }
+                          val rp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                          rp.topMargin = px(6f)
+                          list.addView(tv, rp)
+                          panelRows.add(tv)
+                          panelStarts.add(st)
+                      }
+                  }
+
+                  val lp = WindowManager.LayoutParams(
+                      w, h, overlayType(),
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                          WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                          WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH,
+                      PixelFormat.TRANSLUCENT
+                  )
+                  lp.gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+                  lp.y = px(90f)
+                  box.setOnTouchListener { _, e ->
+                      if (e.actionMasked == MotionEvent.ACTION_OUTSIDE) hidePanel()
+                      false
+                  }
+                  try {
+                      manager.addView(box, lp)
+                  } catch (e: Exception) {
+                      panelRows.clear()
+                      panelStarts.clear()
+                      return
+                  }
+                  panel = box
+                  panelIdx = -1
+                  refreshPanel()
+                  scroll.post {
+                      val cur = panelRows.getOrNull(panelIdx)
+                      if (cur != null) scroll.scrollTo(0, max(0, cur.top - px(40f)))
+                  }
+              }
+
+              private fun hidePanel() {
+                  val p = panel ?: return
+                  try {
+                      windowManager?.removeView(p)
+                  } catch (e: Exception) {
+                  }
+                  panel = null
+                  panelRows.clear()
+                  panelStarts.clear()
+                  panelIdx = -1
+              }
+
+              private fun refreshPanel() {
+                  if (panel == null || panelRows.isEmpty()) return
+                  val idx = (player.currentPosition / SEG_MS).toInt().coerceIn(0, panelRows.size - 1)
+                  if (idx == panelIdx) return
+                  panelIdx = idx
+                  for (i in 0 until panelRows.size) {
+                      val tv = panelRows[i]
+                      val bg = GradientDrawable()
+                      bg.cornerRadius = px(12f).toFloat()
+                      if (i == idx) {
+                          bg.setColor(C_ACCENT)
+                          tv.setTextColor(C_DARK)
+                          tv.typeface = Typeface.DEFAULT_BOLD
+                      } else {
+                          bg.setColor(C_SURFACE)
+                          tv.setTextColor(C_TEXT)
+                          tv.typeface = Typeface.DEFAULT
+                      }
+                      tv.background = bg
+                  }
+              }
+
+              private fun fmt(ms: Long): String {
+                  val total = max(0L, ms) / 1000L
+                  val h = total / 3600L
+                  val m = (total % 3600L) / 60L
+                  val s = total % 60L
+                  return if (h > 0L) {
+                      String.format(Locale.US, "%d:%02d:%02d", h, m, s)
+                  } else {
+                      String.format(Locale.US, "%d:%02d", m, s)
+                  }
+              }
+
+              // ------------------------------------------------------- notification
+
+              private fun notificationManager(): NotificationManager =
+                  getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+
+              private fun createChannel() {
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      val ch = NotificationChannel(CHANNEL, "تشغيل المحاضرة", NotificationManager.IMPORTANCE_LOW)
+                      notificationManager().createNotificationChannel(ch)
+                  }
+              }
+
+              private fun enterForeground() {
+                  val n = buildNotification()
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                      startForeground(NOTIF_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK)
+                  } else {
+                      startForeground(NOTIF_ID, n)
+                  }
+              }
+
+              @Suppress("DEPRECATION")
+              private fun buildNotification(): Notification {
+                  val open = PendingIntent.getActivity(
+                      this, 0, Intent(this, MainActivity::class.java),
+                      PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+                  )
+                  val stopIntent = Intent(this, PlayerService::class.java)
+                  stopIntent.action = ACTION_STOP
+                  val stop = PendingIntent.getService(
+                      this, 1, stopIntent,
+                      PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+                  )
+                  val b = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      Notification.Builder(this, CHANNEL)
+                  } else {
+                      Notification.Builder(this)
+                  }
+                  b.setSmallIcon(android.R.drawable.ic_media_play)
+                  b.setContentTitle(if (title.isEmpty()) "مشغل المحاضرة" else title)
+                  b.setContentText("اضغط لفتح المشغل")
+                  b.setContentIntent(open)
+                  b.setOngoing(true)
+                  b.addAction(
+                      Notification.Action.Builder(
+                          Icon.createWithResource(this, android.R.drawable.ic_menu_close_clear_cancel),
+                          "إيقاف وإغلاق",
+                          stop
+                      ).build()
+                  )
+                  return b.build()
+              }
+
+              override fun onDestroy() {
+                  handler.removeCallbacks(saver)
+                  handler.removeCallbacks(ticker)
+                  savePosition()
+                  hideBall()
+                  player.release()
+                  super.onDestroy()
+              }
+
+              companion object {
+                  const val ACTION_STOP = "app.lectureplayer.STOP"
+                  const val ACTION_ADD = "app.lectureplayer.ADD"
+                  const val ACTION_PLAY_INDEX = "app.lectureplayer.PLAY_INDEX"
+                  const val ACTION_RESUME = "app.lectureplayer.RESUME"
+                  const val ACTION_CLEAR = "app.lectureplayer.CLEAR"
+                  const val EXTRA_URIS = "uris"
+                  const val EXTRA_NAMES = "names"
+                  const val EXTRA_INDEX = "index"
+                  const val SKIP_MS = 15_000L
+                  private const val SEG_MS = 300_000L
+                  private const val CHANNEL = "playback"
+                  private const val NOTIF_ID = 1
+                  private const val S_DP = 120f
+                  private const val D_DP = 92f
+                  private const val M_DP = 250f
+              }
+          }
+
+          /** Center button of the ball: two bars while playing, a triangle while paused. */
+          class PlayPauseIcon(context: Context) : View(context) {
+              private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+              private var playing = true
+
+              init {
+                  paint.color = Color.WHITE
+              }
+
+              fun setPlaying(p: Boolean) {
+                  if (playing != p) {
+                      playing = p
+                      invalidate()
+                  }
+              }
+
+              override fun onDraw(canvas: Canvas) {
+                  super.onDraw(canvas)
+                  val w = width.toFloat()
+                  val h = height.toFloat()
+                  if (playing) {
+                      val bw = w * 0.14f
+                      val bh = h * 0.42f
+                      val top = (h - bh) / 2f
+                      val gap = w * 0.12f
+                      val left1 = w / 2f - gap / 2f - bw
+                      val left2 = w / 2f + gap / 2f
+                      canvas.drawRoundRect(left1, top, left1 + bw, top + bh, bw / 3f, bw / 3f, paint)
+                      canvas.drawRoundRect(left2, top, left2 + bw, top + bh, bw / 3f, bw / 3f, paint)
+                  } else {
+                      val s = h * 0.44f
+                      val x0 = w / 2f - s * 0.3f
+                      val path = Path()
+                      path.moveTo(x0, h / 2f - s / 2f)
+                      path.lineTo(x0, h / 2f + s / 2f)
+                      path.lineTo(x0 + s * 0.85f, h / 2f)
+                      path.close()
+                      canvas.drawPath(path, paint)
+                  }
+              }
+          }
+
+          /** Circular timeline around the ball: playback progress, the A-B loop and its two markers. */
+          class RingView(context: Context) : View(context) {
+              private val d = resources.displayMetrics.density
+              private val track = Paint(Paint.ANTI_ALIAS_FLAG)
+              private val loop = Paint(Paint.ANTI_ALIAS_FLAG)
+              private val prog = Paint(Paint.ANTI_ALIAS_FLAG)
+              private val head = Paint(Paint.ANTI_ALIAS_FLAG)
+              private val dot = Paint(Paint.ANTI_ALIAS_FLAG)
+              private val dotLine = Paint(Paint.ANTI_ALIAS_FLAG)
+              private val letter = Paint(Paint.ANTI_ALIAS_FLAG)
+              private val oval = RectF()
+              private var p = 0f
+              private var a = -1f
+              private var b = -1f
+
+              init {
+                  track.style = Paint.Style.STROKE
+                  track.strokeWidth = 4f * d
+                  track.color = Color.parseColor("#33FFFFFF")
+                  loop.style = Paint.Style.STROKE
+                  loop.strokeWidth = 4f * d
+                  loop.color = C_RED
+                  prog.style = Paint.Style.STROKE
+                  prog.strokeWidth = 4f * d
+                  prog.strokeCap = Paint.Cap.ROUND
+                  prog.color = C_ACCENT
+                  head.style = Paint.Style.FILL
+                  head.color = Color.WHITE
+                  dot.style = Paint.Style.FILL
+                  dot.color = Color.WHITE
+                  dotLine.style = Paint.Style.STROKE
+                  dotLine.strokeWidth = 1.5f * d
+                  dotLine.color = C_ACCENT
+                  letter.textAlign = Paint.Align.CENTER
+                  letter.typeface = Typeface.DEFAULT_BOLD
+                  letter.textSize = 8f * d
+                  letter.color = C_DARK
+              }
+
+              fun setState(np: Float, na: Float, nb: Float) {
+                  val q = np.coerceIn(0f, 1f)
+                  if (abs(q - p) < 0.0005f && na == a && nb == b) return
+                  p = q
+                  a = na
+                  b = nb
+                  invalidate()
+              }
+
+              override fun onDraw(canvas: Canvas) {
+                  val cx = width / 2f
+                  val cy = height / 2f
+                  val r = min(width, height) / 2f - 6f * d
+                  oval.set(cx - r, cy - r, cx + r, cy + r)
+                  canvas.drawCircle(cx, cy, r, track)
+                  if (a >= 0f && b > a) canvas.drawArc(oval, -90f + 360f * a, 360f * (b - a), false, loop)
+                  if (p > 0f) canvas.drawArc(oval, -90f, 360f * p, false, prog)
+                  val ang = Math.toRadians((-90f + 360f * p).toDouble()).toFloat()
+                  canvas.drawCircle(cx + r * cos(ang), cy + r * sin(ang), 3.2f * d, head)
+                  if (a >= 0f) marker(canvas, cx, cy, r, a, "A")
+                  if (b >= 0f) marker(canvas, cx, cy, r, b, "B")
+              }
+
+              private fun marker(c: Canvas, cx: Float, cy: Float, r: Float, f: Float, s: String) {
+                  val ang = Math.toRadians((-90f + 360f * f).toDouble()).toFloat()
+                  val x = cx + r * cos(ang)
+                  val y = cy + r * sin(ang)
+                  c.drawCircle(x, y, 5.5f * d, dot)
+                  c.drawCircle(x, y, 5.5f * d, dotLine)
+                  c.drawText(s, x, y - (letter.ascent() + letter.descent()) / 2f, letter)
+              }
+          }
+
+          /** Items that unfold in an arc around the ball, always toward the middle of the screen. */
+          class RadialMenuView(context: Context) : View(context) {
+
+              class Item(val glyph: String, val label: String, val fill: Int, val dim: Boolean)
+
+              private val d = resources.displayMetrics.density
+              private val overshoot = OvershootInterpolator(1.3f)
+              private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+              private val ringPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+              private val glyphPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+              private val linePaint = Paint(Paint.ANTI_ALIAS_FLAG)
+              private val labelPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+
+              private var items: List<Item> = emptyList()
+              private var base = 0f
+
+              var t = 0f
+                  set(v) {
+                      field = v
+                      invalidate()
+                  }
+
+              var pressedIdx = -1
+                  set(v) {
+                      if (field != v) {
+                          field = v
+                          invalidate()
+                      }
+                  }
+
+              init {
+                  ringPaint.style = Paint.Style.STROKE
+                  ringPaint.strokeWidth = 1.5f * d
+                  ringPaint.color = C_ACCENT
+                  glyphPaint.textAlign = Paint.Align.CENTER
+                  glyphPaint.typeface = Typeface.DEFAULT_BOLD
+                  glyphPaint.textSize = 20f * d
+                  linePaint.style = Paint.Style.STROKE
+                  linePaint.strokeWidth = 2.5f * d
+                  linePaint.strokeCap = Paint.Cap.ROUND
+                  labelPaint.textAlign = Paint.Align.CENTER
+                  labelPaint.textSize = 11f * d
+                  labelPaint.typeface = Typeface.DEFAULT_BOLD
+                  labelPaint.color = C_TEXT
+              }
+
+              fun configure(list: List<Item>, baseAngle: Float) {
+                  items = list
+                  base = baseAngle
+                  pressedIdx = -1
+                  invalidate()
+              }
+
+              private fun centerX(i: Int): Float {
+                  val ang = base + (i - (items.size - 1) / 2f) * STEP
+                  return width / 2f + RADIUS_DP * d * cos(ang)
+              }
+
+              private fun centerY(i: Int): Float {
+                  val ang = base + (i - (items.size - 1) / 2f) * STEP
+                  return height / 2f + RADIUS_DP * d * sin(ang)
+              }
+
+              fun itemAt(x: Float, y: Float): Int {
+                  if (t < 0.5f) return -1
+                  for (i in 0 until items.size) {
+                      if (hypot(x - centerX(i), y - centerY(i)) <= (ITEM_DP + 4f) * d) return i
+                  }
+                  return -1
+              }
+
+              override fun onDraw(canvas: Canvas) {
+                  val w2 = width / 2f
+                  val h2 = height / 2f
+                  for (i in 0 until items.size) {
+                      val it = items[i]
+                      val ti = ((t - i * 0.1f) / 0.7f).coerceIn(0f, 1f)
+                      if (ti <= 0f) continue
+                      val e = overshoot.getInterpolation(ti)
+                      val x = w2 + (centerX(i) - w2) * e
+                      val y = h2 + (centerY(i) - h2) * e
+                      val grow = if (i == pressedIdx) 1.12f else 1f
+                      val r = max(0f, ITEM_DP * d * e * grow)
+                      val alpha = ((if (it.dim) 110 else 255) * ti).toInt()
+
+                      fillPaint.color = it.fill
+                      fillPaint.alpha = alpha
+                      canvas.drawCircle(x, y, r, fillPaint)
+                      ringPaint.alpha = alpha
+                      canvas.drawCircle(x, y, r, ringPaint)
+
+                      val dark = it.fill == C_ACCENT
+                      val ink = if (dark) C_DARK else C_TEXT
+                      when (it.glyph) {
+                          "X" -> {
+                              linePaint.color = ink
+                              linePaint.alpha = alpha
+                              val k = 7f * d * e
+                              canvas.drawLine(x - k, y - k, x + k, y + k, linePaint)
+                              canvas.drawLine(x - k, y + k, x + k, y - k, linePaint)
+                          }
+                          "L" -> {
+                              linePaint.color = ink
+                              linePaint.alpha = alpha
+                              val k = 8f * d * e
+                              val g = 6f * d * e
+                              canvas.drawLine(x - k, y - g, x + k, y - g, linePaint)
+                              canvas.drawLine(x - k, y, x + k, y, linePaint)
+                              canvas.drawLine(x - k, y + g, x + k, y + g, linePaint)
+                          }
+                          else -> {
+                              glyphPaint.color = ink
+                              glyphPaint.alpha = alpha
+                              glyphPaint.textSize = 20f * d * e
+                              canvas.drawText(it.glyph, x, y - (glyphPaint.ascent() + glyphPaint.descent()) / 2f, glyphPaint)
+                          }
+                      }
+                      labelPaint.alpha = alpha
+                      canvas.drawText(it.label, x, y + r + 13f * d, labelPaint)
+                  }
+              }
+
+              companion object {
+                  private const val ITEM_DP = 24f
+                  private const val RADIUS_DP = 84f
+                  private const val STEP = 0.91f
+              }
+          }
+          LP_EOF
+          mkdir -p 'app/src/main/java/app/lectureplayer'
+          cat > 'app/src/main/java/app/lectureplayer/MainActivity.kt' <<'LP_EOF'
+          package app.lectureplayer
+
+          import android.Manifest
+          import android.app.Activity
+          import android.content.ComponentName
+          import android.content.Context
+          import android.content.Intent
+          import android.content.ServiceConnection
+          import android.content.pm.PackageManager
+          import android.content.res.ColorStateList
+          import android.graphics.Color
+          import android.graphics.Typeface
+          import android.graphics.drawable.GradientDrawable
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.IBinder
+          import android.os.Looper
+          import android.provider.OpenableColumns
+          import android.provider.Settings
+          import android.view.Gravity
+          import android.view.View
+          import android.view.ViewGroup
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.SeekBar
+          import android.widget.TextView
+          import androidx.media3.common.C
+          import androidx.media3.common.Player
+          import java.util.Locale
+
+          class MainActivity : Activity() {
+
+              private var svc: PlayerService? = null
+              private val ui = Handler(Looper.getMainLooper())
+              private var dragging = false
+              private var shownVersion = -1
+
+              private lateinit var nameView: TextView
+              private lateinit var timeView: TextView
+              private lateinit var seekBar: SeekBar
+              private lateinit var playBtn: Button
+              private lateinit var resumeBtn: Button
+              private lateinit var controls: LinearLayout
+              private lateinit var overlayBox: LinearLayout
+              private lateinit var ballBtn: Button
+              private lateinit var listSection: LinearLayout
+              private lateinit var listTitle: TextView
+              private lateinit var listBox: LinearLayout
+
+              private val conn = object : ServiceConnection {
+                  override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
+                      svc = (binder as PlayerService.LocalBinder).service
+                      svc?.showBall()
+                      refresh()
+                  }
+
+                  override fun onServiceDisconnected(name: ComponentName?) {
+                      svc = null
+                  }
+              }
+
+              private val tick = object : Runnable {
+                  override fun run() {
+                      refresh()
+                      ui.postDelayed(this, 500)
+                  }
+              }
+
+              private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+
+                  val root = LinearLayout(this)
+                  root.orientation = LinearLayout.VERTICAL
+                  root.setPadding(dp(22), dp(40), dp(22), dp(32))
+                  root.layoutDirection = View.LAYOUT_DIRECTION_RTL
+
+                  val title = TextView(this)
+                  title.text = "مشغل المحاضرة"
+                  title.setTextColor(FG)
+                  title.textSize = 26f
+                  title.typeface = Typeface.DEFAULT_BOLD
+                  root.addView(title, matchWrap(0))
+
+                  val sub = TextView(this)
+                  sub.text = "أضف تسجيلًا أو أكثر، ثم اكتب في أي تطبيق وتحكّم بالتسجيل من الكرة العائمة: ١٥ ثانية للخلف أو للأمام. اضغط مطولًا على الزر الأحمر في الكرة لفتح قائمة تكرار A-B وأجزاء التسجيل."
+                  sub.setTextColor(MUTED)
+                  sub.textSize = 14f
+                  sub.setLineSpacing(0f, 1.25f)
+                  root.addView(sub, matchWrap(8))
+
+                  val pick = makeButton("إضافة تسجيلات", true) { pickFiles() }
+                  root.addView(pick, buttonParams(20))
+
+                  resumeBtn = makeButton("متابعة من حيث توقفت", false) {
+                      sendToService(PlayerService.ACTION_RESUME, null)
+                  }
+                  root.addView(resumeBtn, buttonParams(10))
+
+                  nameView = TextView(this)
+                  nameView.setTextColor(FG)
+                  nameView.textSize = 15f
+                  nameView.maxLines = 2
+                  root.addView(nameView, matchWrap(14))
+
+                  controls = LinearLayout(this)
+                  controls.orientation = LinearLayout.VERTICAL
+
+                  seekBar = SeekBar(this)
+                  seekBar.layoutDirection = View.LAYOUT_DIRECTION_LTR
+                  seekBar.progressTintList = ColorStateList.valueOf(ACCENT)
+                  seekBar.thumbTintList = ColorStateList.valueOf(ACCENT)
+                  seekBar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                      override fun onProgressChanged(sb: SeekBar?, progress: Int, fromUser: Boolean) {
+                          if (fromUser) timeView.text = timeText(progress.toLong(), seekBar.max.toLong())
+                      }
+
+                      override fun onStartTrackingTouch(sb: SeekBar?) {
+                          dragging = true
+                      }
+
+                      override fun onStopTrackingTouch(sb: SeekBar?) {
+                          svc?.player?.seekTo(seekBar.progress.toLong())
+                          dragging = false
+                      }
+                  })
+                  controls.addView(seekBar, matchWrap(10))
+
+                  timeView = TextView(this)
+                  timeView.setTextColor(MUTED)
+                  timeView.textSize = 14f
+                  timeView.gravity = Gravity.CENTER
+                  timeView.layoutDirection = View.LAYOUT_DIRECTION_LTR
+                  controls.addView(timeView, matchWrap(0))
+
+                  val row = LinearLayout(this)
+                  row.orientation = LinearLayout.HORIZONTAL
+                  row.layoutDirection = View.LAYOUT_DIRECTION_LTR
+                  val back = makeButton("« 15", false) { svc?.skip(-PlayerService.SKIP_MS) }
+                  playBtn = makeButton("تشغيل", true) { togglePlay() }
+                  val fwd = makeButton("15 »", false) { svc?.skip(PlayerService.SKIP_MS) }
+                  row.addView(back, weighted(1f))
+                  row.addView(playBtn, weighted(1.4f))
+                  row.addView(fwd, weighted(1f))
+                  controls.addView(row, matchWrap(14))
+
+                  ballBtn = makeButton("إخفاء الكرة", false) {
+                      val s = svc
+                      if (s != null) {
+                          s.setBallVisible(!s.isBallShown())
+                          refresh()
+                      }
+                  }
+                  controls.addView(ballBtn, buttonParams(14))
+
+                  val stopBtn = makeButton("إيقاف وإغلاق", false) {
+                      val i = Intent(this, PlayerService::class.java)
+                      i.action = PlayerService.ACTION_STOP
+                      startService(i)
+                  }
+                  controls.addView(stopBtn, buttonParams(10))
+                  root.addView(controls, matchWrap(8))
+
+                  listSection = LinearLayout(this)
+                  listSection.orientation = LinearLayout.VERTICAL
+                  val listHead = LinearLayout(this)
+                  listHead.orientation = LinearLayout.HORIZONTAL
+                  listHead.gravity = Gravity.CENTER_VERTICAL
+                  listTitle = TextView(this)
+                  listTitle.setTextColor(FG)
+                  listTitle.textSize = 17f
+                  listTitle.typeface = Typeface.DEFAULT_BOLD
+                  listHead.addView(listTitle, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                  val clear = TextView(this)
+                  clear.text = "مسح القائمة"
+                  clear.setTextColor(RED)
+                  clear.textSize = 14f
+                  clear.setPadding(dp(10), dp(8), dp(10), dp(8))
+                  clear.setOnClickListener {
+                      val i = Intent(this, PlayerService::class.java)
+                      i.action = PlayerService.ACTION_CLEAR
+                      startService(i)
+                  }
+                  listHead.addView(clear, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+                  listSection.addView(listHead, matchWrap(0))
+                  listBox = LinearLayout(this)
+                  listBox.orientation = LinearLayout.VERTICAL
+                  listSection.addView(listBox, matchWrap(6))
+                  root.addView(listSection, matchWrap(24))
+
+                  overlayBox = LinearLayout(this)
+                  overlayBox.orientation = LinearLayout.VERTICAL
+                  val why = TextView(this)
+                  why.text = "لتظهر الكرة فوق التطبيقات الأخرى، فعّل «العرض فوق التطبيقات الأخرى» لهذا التطبيق."
+                  why.setTextColor(MUTED)
+                  why.textSize = 14f
+                  why.setLineSpacing(0f, 1.25f)
+                  overlayBox.addView(why, matchWrap(0))
+                  val allow = makeButton("السماح بالظهور فوق التطبيقات", true) {
+                      startActivity(
+                          Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:" + packageName))
+                      )
+                  }
+                  overlayBox.addView(allow, buttonParams(10))
+                  root.addView(overlayBox, matchWrap(22))
+
+                  val scroll = ScrollView(this)
+                  scroll.setBackgroundColor(BG)
+                  scroll.isFillViewport = true
+                  scroll.addView(root, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+                  setContentView(scroll)
+
+                  if (Build.VERSION.SDK_INT >= 33 &&
+                      checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+                  ) {
+                      requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 7)
+                  }
+                  refresh()
+              }
+
+              override fun onStart() {
+                  super.onStart()
+                  bindService(Intent(this, PlayerService::class.java), conn, Context.BIND_AUTO_CREATE)
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  svc?.showBall()
+                  ui.post(tick)
+              }
+
+              override fun onPause() {
+                  ui.removeCallbacks(tick)
+                  super.onPause()
+              }
+
+              override fun onStop() {
+                  try {
+                      unbindService(conn)
+                  } catch (e: Exception) {
+                  }
+                  svc = null
+                  super.onStop()
+              }
+
+              // ------------------------------------------------------------- actions
+
+              private fun sendToService(action: String, extra: ((Intent) -> Unit)?) {
+                  val i = Intent(this, PlayerService::class.java)
+                  i.action = action
+                  if (extra != null) extra(i)
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(i) else startService(i)
+              }
+
+              private fun pickFiles() {
+                  val i = Intent(Intent.ACTION_OPEN_DOCUMENT)
+                  i.addCategory(Intent.CATEGORY_OPENABLE)
+                  i.type = "*/*"
+                  i.putExtra(Intent.EXTRA_MIME_TYPES, arrayOf("audio/*", "video/*"))
+                  i.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+                  startActivityForResult(i, REQ_PICK)
+              }
+
+              @Deprecated("Deprecated in Java")
+              override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+                  super.onActivityResult(requestCode, resultCode, data)
+                  if (requestCode != REQ_PICK || resultCode != RESULT_OK) return
+                  val uris = ArrayList<Uri>()
+                  val cd = data?.clipData
+                  if (cd != null) {
+                      for (k in 0 until cd.itemCount) uris.add(cd.getItemAt(k).uri)
+                  } else {
+                      val u = data?.data
+                      if (u != null) uris.add(u)
+                  }
+                  if (uris.isEmpty()) return
+                  val us = ArrayList<String>()
+                  val ns = ArrayList<String>()
+                  for (u in uris) {
+                      try {
+                          contentResolver.takePersistableUriPermission(u, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                      } catch (e: Exception) {
+                      }
+                      us.add(u.toString())
+                      ns.add(queryName(u))
+                  }
+                  sendToService(PlayerService.ACTION_ADD) { i ->
+                      i.putStringArrayListExtra(PlayerService.EXTRA_URIS, us)
+                      i.putStringArrayListExtra(PlayerService.EXTRA_NAMES, ns)
+                  }
+              }
+
+              private fun queryName(uri: Uri): String {
+                  try {
+                      contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c ->
+                          if (c.moveToFirst()) return c.getString(0) ?: ""
+                      }
+                  } catch (e: Exception) {
+                  }
+                  return uri.lastPathSegment ?: "تسجيل"
+              }
+
+              private fun togglePlay() {
+                  val s = svc ?: return
+                  s.togglePlay()
+              }
+
+              private fun rebuildList(s: PlayerService) {
+                  listBox.removeAllViews()
+                  val cur = s.currentIndex
+                  for (i in 0 until s.playlist.size) {
+                      val tv = TextView(this)
+                      tv.text = (i + 1).toString() + ".  " + s.playlist[i].name
+                      tv.textSize = 15f
+                      tv.maxLines = 2
+                      tv.setPadding(dp(14), dp(12), dp(14), dp(12))
+                      val bg = GradientDrawable()
+                      bg.cornerRadius = 12f * resources.displayMetrics.density
+                      if (i == cur) {
+                          bg.setColor(ACCENT)
+                          tv.setTextColor(ACCENT_INK)
+                          tv.typeface = Typeface.DEFAULT_BOLD
+                      } else {
+                          bg.setColor(SURFACE)
+                          tv.setTextColor(FG)
+                      }
+                      tv.background = bg
+                      val idx = i
+                      tv.setOnClickListener {
+                          sendToService(PlayerService.ACTION_PLAY_INDEX) { it.putExtra(PlayerService.EXTRA_INDEX, idx) }
+                      }
+                      val lp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                      lp.topMargin = dp(6)
+                      listBox.addView(tv, lp)
+                  }
+              }
+
+              private fun refresh() {
+                  val s = svc
+                  val has = s != null && s.hasMedia
+                  val count = if (s != null) s.playlist.size else 0
+                  controls.visibility = if (has) View.VISIBLE else View.GONE
+
+                  val canDraw = Settings.canDrawOverlays(this)
+                  overlayBox.visibility = if (canDraw) View.GONE else View.VISIBLE
+                  ballBtn.visibility = if (canDraw) View.VISIBLE else View.GONE
+
+                  if (s == null || count == 0) {
+                      nameView.visibility = View.VISIBLE
+                      nameView.text = "لم تضف تسجيلات بعد"
+                      resumeBtn.visibility = View.GONE
+                      listSection.visibility = View.GONE
+                      return
+                  }
+
+                  listSection.visibility = View.VISIBLE
+                  listTitle.text = "قائمة التشغيل (" + count + ")"
+                  if (s.playlistVersion != shownVersion) {
+                      shownVersion = s.playlistVersion
+                      rebuildList(s)
+                  }
+
+                  if (!has) {
+                      nameView.visibility = View.GONE
+                      resumeBtn.visibility = View.VISIBLE
+                      resumeBtn.text = "متابعة: " + s.title + " · " + fmt(s.player.currentPosition)
+                      return
+                  }
+
+                  nameView.visibility = View.VISIBLE
+                  nameView.text = s.title
+                  resumeBtn.visibility = View.GONE
+                  ballBtn.text = if (s.isBallShown()) "إخفاء الكرة" else "إظهار الكرة"
+                  val p = s.player
+                  val dur = p.duration
+                  val durOk = if (dur == C.TIME_UNSET || dur < 0L) 0L else dur
+                  seekBar.max = durOk.toInt()
+                  if (!dragging) {
+                      val pos = p.currentPosition.coerceIn(0L, durOk)
+                      seekBar.progress = pos.toInt()
+                      timeView.text = timeText(pos, durOk)
+                  }
+                  val playing = p.playWhenReady && p.playbackState != Player.STATE_ENDED
+                  playBtn.text = if (playing) "إيقاف مؤقت" else "تشغيل"
+              }
+
+              // ------------------------------------------------------------- helpers
+
+              private fun timeText(pos: Long, dur: Long): String = fmt(pos) + " / " + fmt(dur)
+
+              private fun fmt(ms: Long): String {
+                  val total = (if (ms < 0L) 0L else ms) / 1000L
+                  val h = total / 3600L
+                  val m = (total % 3600L) / 60L
+                  val r = total % 60L
+                  return if (h > 0L) {
+                      String.format(Locale.US, "%d:%02d:%02d", h, m, r)
+                  } else {
+                      String.format(Locale.US, "%d:%02d", m, r)
+                  }
+              }
+
+              private fun matchWrap(topDp: Int): LinearLayout.LayoutParams {
+                  val lp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                  lp.topMargin = dp(topDp)
+                  return lp
+              }
+
+              private fun buttonParams(topDp: Int): LinearLayout.LayoutParams {
+                  val lp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(54))
+                  lp.topMargin = dp(topDp)
+                  return lp
+              }
+
+              private fun weighted(w: Float): LinearLayout.LayoutParams {
+                  val lp = LinearLayout.LayoutParams(0, dp(58), w)
+                  lp.leftMargin = dp(5)
+                  lp.rightMargin = dp(5)
+                  return lp
+              }
+
+              private fun makeButton(label: String, filled: Boolean, onClick: () -> Unit): Button {
+                  val b = Button(this)
+                  b.text = label
+                  b.isAllCaps = false
+                  b.textSize = 16f
+                  b.typeface = Typeface.DEFAULT_BOLD
+                  b.setTextColor(if (filled) ACCENT_INK else FG)
+                  val bg = GradientDrawable()
+                  bg.cornerRadius = 14f * resources.displayMetrics.density
+                  if (filled) {
+                      bg.setColor(ACCENT)
+                  } else {
+                      bg.setColor(SURFACE)
+                      bg.setStroke(dp(1), LINE)
+                  }
+                  b.background = bg
+                  b.stateListAnimator = null
+                  b.setOnClickListener { onClick() }
+                  return b
+              }
+
+              companion object {
+                  private const val REQ_PICK = 11
+                  private val BG = Color.parseColor("#0B2536")
+                  private val SURFACE = Color.parseColor("#12384F")
+                  private val FG = Color.parseColor("#F4F7F8")
+                  private val MUTED = Color.parseColor("#9DB6C4")
+                  private val LINE = Color.parseColor("#245D7C")
+                  private val ACCENT = Color.parseColor("#1FB8CE")
+                  private val ACCENT_INK = Color.parseColor("#04222E")
+                  private val RED = Color.parseColor("#E0463C")
+              }
+          }
+          LP_EOF
+
+      - name: Build debug APK
+        run: gradle assembleDebug --no-daemon --stacktrace
+
+      - name: Name the APK
+        run: cp app/build/outputs/apk/debug/app-debug.apk LecturePlayer.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LecturePlayer-apk
+          path: LecturePlayer.apk
+
+      - name: Publish as a release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_NUM: ${{ github.run_number }}
+        run: |
+          gh release create "apk-$RUN_NUM" LecturePlayer.apk --title "LecturePlayer build $RUN_NUM" --notes "Debug APK. Download LecturePlayer.apk and install it."
